@@ -1,0 +1,25 @@
+@'
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# App data (conversation history + timing logs)
+data/
+
+# Secrets
+.env
+.env.*
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+'@ | Out-File -Encoding utf8 .gitignore

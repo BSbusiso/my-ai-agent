@@ -2,7 +2,8 @@
 My Local AI Assistant
 ---------------------
 A Tkinter chat app that talks to Ollama, routes each question to the
-right model, streams the reply, times it, and remembers history.
+right model, streams the reply, times it, and remembers history
+across multiple sessions (shown in a sidebar).
 
 Models used:
   - General chat  : qwen2.5:3b
@@ -10,8 +11,8 @@ Models used:
   - Coding (deep) : deepseek-coder:6.7b
 
 Commands:
-  /new      start a fresh conversation (clears saved history)
-  /clear    delete saved history (with confirmation)
+  /new      start a fresh conversation (current one is kept in sidebar)
+  /clear    delete ALL saved conversations (with confirmation)
   /chat     force the general model
   /code     force a coding model (complexity-routed)
   /fast     force the light coding model
@@ -38,7 +39,6 @@ import ollama
 
 GENERAL_MODEL = "qwen2.5:3b"
 
-# Coding models, ordered fast -> strong
 CODING_MODELS = [
     "qwen2.5-coder:3b",
     "deepseek-coder:6.7b",
@@ -130,6 +130,7 @@ def strip_command_prefix(question: str) -> str:
             return question[len(prefix):].strip()
     return question.strip()
 
+
 class ModelRotator:
     """Cycles through a list of models, one per call."""
     def __init__(self, models):
@@ -147,8 +148,7 @@ class ModelRotator:
 # -----------------------------
 
 def timed_stream(func):
-    """Time a generator function that yields chunks.
-    Prints TTFT, total, and chunk count to the terminal."""
+    """Time a generator function that yields chunks."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
@@ -173,8 +173,7 @@ def timed_stream(func):
 
 
 def with_fallback(models):
-    """Decorator factory: try each model in order until one succeeds.
-    Only retries if the failure happens before the first chunk is sent."""
+    """Try each model in order until one succeeds (pre-first-chunk only)."""
     def decorator(func):
         @wraps(func)
         def wrapper(history, model_name, system_prompt, on_chunk=None, **kwargs):
@@ -199,7 +198,6 @@ def with_fallback(models):
                     last_error = error
                     print(f"[fallback] {candidate} failed: {error}")
                     if first_chunk_sent:
-                        # Too late to retry — user already saw partial output.
                         raise
                     continue
 
@@ -209,31 +207,41 @@ def with_fallback(models):
 
 
 # -----------------------------
-# Persistent history
+# Persistent history (sessions)
 # -----------------------------
 
-def load_history():
+def _migrate(old):
+    """Wrap old flat-history format into a session list."""
+    if not old:
+        return []
+    if isinstance(old, list) and old and "role" in old[0]:
+        return [{
+            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+            "title": "Imported conversation",
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "messages": old,
+        }]
+    return old
+
+
+def load_sessions():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not HISTORY_FILE.exists():
         return []
     try:
-        with HISTORY_FILE.open("r", encoding="utf-8") as file:
-            history = json.load(file)
-        if not isinstance(history, list):
-            raise ValueError("History must be a list.")
-        return history
-    except (json.JSONDecodeError, ValueError) as error:
-        raise RuntimeError(
-            f"Could not read {HISTORY_FILE}. Back it up before repairing it."
-        ) from error
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _migrate(data)
+    except (json.JSONDecodeError, ValueError):
+        return []
 
 
-def save_history(history):
+def save_sessions(sessions):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temporary_file = DATA_DIR / "chat_history.tmp"
-    with temporary_file.open("w", encoding="utf-8") as file:
-        json.dump(history, file, indent=2, ensure_ascii=False)
-    temporary_file.replace(HISTORY_FILE)
+    tmp = DATA_DIR / "chat_history.tmp"
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2, ensure_ascii=False)
+    tmp.replace(HISTORY_FILE)
 
 
 def log_timing(model_name, ttft, total, chunks):
@@ -304,13 +312,17 @@ class ChatApp:
     def __init__(self, root):
         self.root = root
         self.root.title("My Local AI Assistant")
-        self.root.geometry("860x680")
-        self.root.minsize(620, 500)
+        self.root.geometry("960x680")
+        self.root.minsize(720, 500)
 
-        try:
-            self.history = load_history()
-        except RuntimeError as error:
-            messagebox.showerror("History error", str(error))
+        # --- sessions ---
+        self.sessions = load_sessions()
+        if self.sessions:
+            self.current_session_index = len(self.sessions) - 1
+            self.history = list(self.sessions[-1]["messages"])
+        else:
+            self.sessions = []
+            self.current_session_index = None
             self.history = []
 
         self.coder_pool = ModelRotator(CODING_MODELS)
@@ -318,46 +330,117 @@ class ChatApp:
         self._build_widgets()
         self._check_ollama()
 
+    # ---- Session management ----
+
+    def _refresh_session_list(self):
+        """Redraw the sidebar listbox from self.sessions."""
+        self.session_listbox.delete(0, tk.END)
+        for s in self.sessions:
+            title = s["title"]
+            if len(title) > 28:
+                title = title[:27] + "…"
+            self.session_listbox.insert(tk.END, "  " + title)
+        if self.current_session_index is not None:
+            self.session_listbox.selection_clear(0, tk.END)
+            self.session_listbox.selection_set(self.current_session_index)
+
+    def _on_session_click(self, event):
+        sel = self.session_listbox.curselection()
+        if not sel:
+            return
+        index = sel[0]
+        if index == self.current_session_index:
+            return
+        self._load_session(index)
+
+    def _load_session(self, index):
+        """Switch the active conversation to sessions[index]."""
+        # persist current session's messages before switching
+        if self.current_session_index is not None:
+            self.sessions[self.current_session_index]["messages"] = list(self.history)
+            save_sessions(self.sessions)
+
+        self.current_session_index = index
+        self.history = list(self.sessions[index]["messages"])
+
+        self.chat_display.configure(state=tk.NORMAL)
+        self.chat_display.delete("1.0", tk.END)
+        self.chat_display.configure(state=tk.DISABLED)
+        self._append(f"Loaded: {self.sessions[index]['title']}\n\n", "system")
+        for msg in self.history:
+            if msg["role"] == "user":
+                self._append(f"You: {msg['content']}\n", "user")
+            else:
+                self._append("Assistant: ", "assistant")
+                self._append(msg["content"] + "\n\n", "assistant")
+
     # ---- UI construction ----
 
     def _build_widgets(self):
+        # ---- TOP BAR ----
         top = tk.Frame(self.root)
         top.pack(fill=tk.X, padx=10, pady=(10, 0))
 
-        tk.Label(
-            top, text="Auto-routing: ON", font=("Consolas", 10, "bold"), fg="#0b8043"
-        ).pack(side=tk.LEFT)
-
+        tk.Label(top, text="Auto-routing: ON",
+                 font=("Consolas", 10, "bold"), fg="#0b8043").pack(side=tk.LEFT)
         tk.Button(top, text="New chat", command=self.new_chat).pack(side=tk.RIGHT)
         tk.Button(top, text="Clear saved", command=self.clear_history).pack(
-            side=tk.RIGHT, padx=(0, 6)
-        )
+            side=tk.RIGHT, padx=(0, 6))
 
+        # ---- MAIN AREA: sidebar | chat ----
+        main = tk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 5))
+
+        # --- Sidebar ---
+        sidebar = tk.Frame(main, width=200, bg="#f4f4f4")
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+
+        tk.Label(sidebar, text="History", font=("Consolas", 10, "bold"),
+                 bg="#f4f4f4", anchor="w", padx=8, pady=6).pack(fill=tk.X)
+
+        lb_frame = tk.Frame(sidebar, bg="#f4f4f4")
+        lb_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        self.session_listbox = tk.Listbox(
+            lb_frame, font=("Consolas", 9), activestyle="none",
+            selectmode=tk.SINGLE, borderwidth=0, highlightthickness=0,
+            exportselection=False,
+        )
+        sb = tk.Scrollbar(lb_frame, command=self.session_listbox.yview)
+        self.session_listbox.configure(yscrollcommand=sb.set)
+        self.session_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.session_listbox.bind("<<ListboxSelect>>", self._on_session_click)
+
+        # --- Chat display ---
         self.chat_display = scrolledtext.ScrolledText(
-            self.root, wrap=tk.WORD, state=tk.DISABLED,
+            main, wrap=tk.WORD, state=tk.DISABLED,
             font=("Consolas", 11), padx=10, pady=10,
         )
-        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 5))
+        self.chat_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
         self.chat_display.tag_config(
-            "user", foreground="#1a73e8", font=("Consolas", 11, "bold")
-        )
+            "user", foreground="#1a73e8", font=("Consolas", 11, "bold"))
         self.chat_display.tag_config("assistant", foreground="#0b8043")
         self.chat_display.tag_config(
-            "system", foreground="#888888", font=("Consolas", 9, "italic")
-        )
-        self.chat_display.tag_config("timing", foreground="#b06000", font=("Consolas", 9, "italic"))
+            "system", foreground="#888888", font=("Consolas", 9, "italic"))
+        self.chat_display.tag_config(
+            "timing", foreground="#b06000", font=("Consolas", 9, "italic"))
 
+        # ---- BOTTOM BAR ----
         bottom = tk.Frame(self.root)
         bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         self.entry = tk.Entry(bottom, font=("Consolas", 11))
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
-        self.entry.bind("<Return>", lambda event: self.send_message())
+        self.entry.bind("<Return>", lambda e: self.send_message())
 
-        tk.Button(bottom, text="Send", width=8, command=self.send_message).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
+        tk.Button(bottom, text="Send", width=8,
+                  command=self.send_message).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._refresh_session_list()
 
     # ---- helpers ----
 
@@ -378,7 +461,7 @@ class ChatApp:
                 "system",
             )
             missing = [m for m in [GENERAL_MODEL, *CODING_MODELS]
-                    if m not in installed and f"{m}:latest" not in installed]
+                       if m not in installed and f"{m}:latest" not in installed]
             if missing:
                 self._append(
                     f"[warn] not installed: {', '.join(missing)} "
@@ -407,7 +490,6 @@ class ChatApp:
             self.clear_history()
             return
 
-        # Decide category and model
         category = detect_category(raw)
         question = strip_command_prefix(raw)
 
@@ -421,7 +503,6 @@ class ChatApp:
             model_name = GENERAL_MODEL
             system_prompt = SYSTEM_PROMPT_GENERAL
 
-        # Show user message and routing
         self._append(f"You: {question}\n", "user")
         self._append(f"[{category} -> {model_name}]\n", "system")
         self._append("Assistant: ", "assistant")
@@ -449,7 +530,19 @@ class ChatApp:
                     on_chunk=on_chunk, on_timing=on_timing,
                 )
                 self.history.append({"role": "assistant", "content": answer})
-                save_history(self.history)
+
+                if self.current_session_index is not None:
+                    sess = self.sessions[self.current_session_index]
+                    sess["messages"] = list(self.history)
+                    if sess["title"] in ("(new conversation)", ""):
+                        first_user = next(
+                            (m["content"] for m in self.history
+                             if m["role"] == "user"),
+                            "Conversation",
+                        )
+                        sess["title"] = first_user[:40]
+                    save_sessions(self.sessions)
+                    self.root.after(0, self._refresh_session_list)
             except Exception as error:
                 self.history.pop()
                 self._append(f"\n[error] {error}\n\n", "system")
@@ -460,18 +553,38 @@ class ChatApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def new_chat(self):
+        # save current session first
+        if self.current_session_index is not None:
+            self.sessions[self.current_session_index]["messages"] = list(self.history)
+            save_sessions(self.sessions)
+
+        self.sessions.append({
+            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+            "title": "(new conversation)",
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "messages": [],
+        })
+        self.current_session_index = len(self.sessions) - 1
         self.history = []
-        save_history(self.history)
+
         self.chat_display.configure(state=tk.NORMAL)
         self.chat_display.delete("1.0", tk.END)
         self.chat_display.configure(state=tk.DISABLED)
         self._append("Started a fresh conversation.\n\n", "system")
+        self._refresh_session_list()
 
     def clear_history(self):
-        if messagebox.askyesno("Clear history", "Delete saved conversation history?"):
+        if messagebox.askyesno("Clear history",
+                            "Delete ALL saved conversations?"):
+            self.sessions = []
+            self.current_session_index = None
             self.history = []
-            save_history(self.history)
-            self._append("Conversation history cleared.\n\n", "system")
+            save_sessions(self.sessions)
+            self.chat_display.configure(state=tk.NORMAL)
+            self.chat_display.delete("1.0", tk.END)
+            self.chat_display.configure(state=tk.DISABLED)
+            self._append("All history cleared.\n\n", "system")
+            self._refresh_session_list()
 
 
 # -----------------------------
